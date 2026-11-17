@@ -84,6 +84,7 @@ class Bot(private val conn: UsbDeviceConnection, private val epIn: UsbEndpoint, 
         throw FatalException("CSW 읽기 실패")
     }
 
+    @Synchronized
     fun cmd(cdb: IntArray, dataLen: Int = 0): BotResult {
         val t = tag++
         val cbw = ByteBuffer.allocate(31).order(ByteOrder.LITTLE_ENDIAN)

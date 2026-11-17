@@ -69,6 +69,7 @@ private sealed interface Cmd {
     data object Up : Cmd
     data class Rip(val nos: List<Int>) : Cmd
     data class Copy(val e: IsoEntry) : Cmd
+    data object CopyAll : Cmd
     data object Dump : Cmd
 }
 
@@ -112,6 +113,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
     fun up() = send(Cmd.Up)
     fun rip(nos: List<Int>) = send(Cmd.Rip(nos))
     fun copy(e: IsoEntry) = send(Cmd.Copy(e))
+    fun copyAll() = send(Cmd.CopyAll)
     fun dumpIso() = send(Cmd.Dump)
     fun cancel() { session?.cancel = true }
 
@@ -149,18 +151,30 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
         private var lastProbe = 0L
         private var lastPos = 0L
         private var lastProg = 0L
+        private var lastState = ""
 
         fun start() = th.start()
         fun stop() { alive = false; cancel = true; q.offer(Cmd.Quit) }
         fun applyVolume() { track?.setVolume(volume / 100f) }
         private fun post(f: (UiState) -> UiState) { if (alive) _ui.update(f) }
         private fun now() = System.currentTimeMillis()
-        private fun setState(s: String) = post { it.copy(state = s) }
+        private fun logState(s: String) {
+            if (s == lastState) return
+            lastState = s
+            when (s) {
+                "nodisc" -> AppLog.i("디스크 없음")
+                "loading" -> AppLog.i("디스크 읽는 중…")
+                "unsupported" -> AppLog.w("지원하지 않는 디스크")
+                "unreadable" -> AppLog.w("디스크를 읽지 못함")
+            }
+        }
+
+        private fun setState(s: String) { logState(s); post { it.copy(state = s) } }
 
         // ---------- 메인 루프 ----------
         private fun loop() {
             try {
-                runCatching { val v = bot.inquiry(); post { it.copy(vendor = v) } }
+                runCatching { val v = bot.inquiry(); AppLog.i("드라이브 연결: ${v.ifBlank { "알 수 없음" }}"); post { it.copy(vendor = v) } }
                 while (alive) {
                     try {
                         val p = pending
@@ -186,7 +200,8 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                         playChunk()
                     } catch (e: FatalException) {
                         errs++
-                        if (errs >= 5) { post { it.copy(connected = false, msg = "ODD 통신이 끊어졌어요") }; break }
+                        AppLog.w("USB 통신 오류 ($errs/5): ${e.message}")
+                        if (errs >= 5) { AppLog.e("ODD 통신이 끊어졌어요"); post { it.copy(connected = false, msg = "ODD 통신이 끊어졌어요") }; break }
                         dropDisc("unreadable")
                         Thread.sleep(1000)
                     }
@@ -194,6 +209,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             } catch (_: InterruptedException) {
             } finally {
                 track?.release(); track = null
+                OddHub.clear(ctx, bot)
             }
         }
 
@@ -246,7 +262,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 is Cmd.Open -> if (mode == "data" && c.e.isDir) { stack.add(c.e); showDir() }
                 Cmd.Up -> if (mode == "data" && stack.size > 1) { stack.removeLast(); showDir() }
                 is Cmd.Rip -> if (mode == "audio") { pending = c; playing = false; return true }
-                is Cmd.Copy, Cmd.Dump -> if (mode == "data") { pending = c; return true }
+                is Cmd.Copy, Cmd.CopyAll, Cmd.Dump -> if (mode == "data") { pending = c; return true }
             }
             return false
         }
@@ -260,6 +276,8 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
         // ---------- 디스크 인식 ----------
         private fun dropDisc(state: String) {
             mode = "none"; aud = emptyList(); playing = false
+            logState(state)
+            OddHub.clear(ctx, bot)
             flushAudio(); track?.pause()
             post {
                 it.copy(state = state, kind = "", tracks = emptyList(), media = "", album = "", artist = "",
@@ -269,7 +287,12 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
         }
 
         private fun identify() {
-            val (toc, leadout) = try { bot.readToc() } catch (e: FatalException) { setState("unreadable"); return }
+            val (toc, leadout) = try {
+                bot.readToc()
+            } catch (e: FatalException) {
+                if (lastState != "unreadable") AppLog.w("TOC 읽기 실패: ${e.message}")
+                setState("unreadable"); return
+            }
             runCatching { bot.setSpeed(cfg.playSpeed * 176) }
             val media = runCatching { bot.mediaName() }.getOrDefault("")
             val tracks = toc.mapIndexedNotNull { i, t ->
@@ -280,10 +303,17 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             if (tracks.isNotEmpty()) {
                 mode = "audio"
                 post { it.copy(state = "ready", kind = "audio", media = media, tracks = tracks, titles = emptyList(), msg = "") }
+                lastState = "ready"
+                AppLog.i("오디오 CD 인식: ${tracks.size}트랙" + if (media.isNotBlank()) " · $media" else "")
                 val id = MusicBrainz.discId(toc, leadout)
                 net.execute {
                     val r = MusicBrainz.get(ctx, id, tracks.size, cfg.lookup)
-                    if (r != null) post { if (it.tracks == tracks) it.copy(album = r.album, artist = r.artist, titles = r.titles) else it }
+                    if (r != null) {
+                        AppLog.i("앨범 정보: ${r.album.ifBlank { "(제목 없음)" }}")
+                        post { if (it.tracks == tracks) it.copy(album = r.album, artist = r.artist, titles = r.titles) else it }
+                    } else {
+                        AppLog.i(if (cfg.lookup) "앨범 정보 없음 (MusicBrainz)" else "앨범 정보 조회 꺼짐")
+                    }
                 }
                 if (cfg.autoplay) startTrack(0)
             } else {
@@ -291,6 +321,9 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 charset = info.charset
                 stack.clear(); info.root?.let { stack.add(it) }
                 mode = "data"
+                info.root?.let { OddHub.publish(ctx, bot, it, info.charset, info.label) }
+                lastState = "ready"
+                AppLog.i("데이터 디스크 인식: ${info.label.ifBlank { "(이름 없음)" }} · ${info.fs}" + if (media.isNotBlank()) " · $media" else "")
                 post {
                     it.copy(state = "ready", kind = "data", media = media, fs = info.fs, label = info.label,
                         sizeMb = info.sizeMb, entries = info.entries, path = emptyList(), msg = "")
@@ -363,6 +396,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             if (r.status != 0 || data.size != n * AUDIO_SECTOR) {
                 val sn = bot.sense()
                 if (sn != null && (sn.first == 2 || sn.first == 6)) { dropDisc("loading"); return }
+                AppLog.w("읽기 오류: LBA $lba (+$n 섹터) 무음 처리")
                 data = ByteArray(n * AUDIO_SECTOR)   // 오류 구간은 무음
             }
             errs = 0
@@ -404,6 +438,13 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
 
         private fun runJob(c: Cmd) {
             cancel = false
+            val what = when (c) {
+                is Cmd.Rip -> "리핑 (${c.nos.size}트랙)"
+                is Cmd.Copy -> "복사: ${c.e.name}"
+                Cmd.CopyAll -> "전체 파일 복사"
+                else -> "ISO로 저장"
+            }
+            AppLog.i("작업 시작 — $what")
             flushAudio(); playing = false
             post { it.copy(cur = null, posSec = 0, job = JobUi("준비 중", 0), msg = "") }
             var res: String
@@ -411,6 +452,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 res = when (c) {
                     is Cmd.Rip -> jobRip(c.nos)
                     is Cmd.Copy -> jobCopy(c.e)
+                    Cmd.CopyAll -> jobCopyAll()
                     else -> jobDump()
                 }
             } catch (e: FatalException) {
@@ -419,6 +461,11 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 res = "작업 실패: ${e.message}"
             }
             runCatching { bot.setSpeed(cfg.playSpeed * 176) }
+            when {
+                res.contains("실패") -> AppLog.e(res)
+                res.contains("취소") -> AppLog.w(res)
+                else -> AppLog.i(res)
+            }
             post { it.copy(job = null, msg = res) }
         }
 
@@ -486,6 +533,15 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             val nodes = ArrayList<IsoNode>()
             nodes += IsoNode(base, e.extent, e.size, e.isDir)
             if (e.isDir) nodes += Iso.walk(bot, e.extent, e.size, charset, base)
+            return copyNodes(nodes)
+        }
+
+        private fun jobCopyAll(): String {
+            val r = stack.firstOrNull() ?: return "복사할 파일이 없어요"
+            return copyNodes(Iso.walk(bot, r.extent, r.size, charset, emptyList()))
+        }
+
+        private fun copyNodes(nodes: List<IsoNode>): String {
             val total = nodes.filter { !it.isDir }.sumOf { it.size }.coerceAtLeast(1)
             runCatching { bot.setSpeed(0xFFFF) }
             val root = child(outRoot(), safeName(_ui.value.label.ifBlank { "disc" }))

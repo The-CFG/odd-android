@@ -29,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
@@ -62,7 +63,7 @@ class MainActivity : ComponentActivity() {
                 ACTION_PERM -> {
                     val d = i.usbDevice()
                     if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && d != null) open(d)
-                    else status = "USB 권한이 거부됐어요"
+                    else report("USB 권한이 거부됐어요", true)
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> scan()
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -77,6 +78,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
         cfg = Settings(this)
+        AppLog.init(applicationContext)
+        AppLog.i("앱 시작")
         engine = OddEngine(applicationContext, cfg)
         outTree = cfg.outTree
         status = "ODD를 USB로 연결해 주세요"
@@ -107,13 +110,20 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    /** 상태 문구를 바꾸고, 바뀐 경우에만 로그에 남긴다 (onResume 반복 스캔 방지) */
+    private fun report(msg: String, warn: Boolean = false) {
+        if (msg == status) return
+        status = msg
+        if (warn) AppLog.w(msg) else AppLog.i(msg)
+    }
+
     private fun scan() {
         if (current != null) return
         val dev = usb.deviceList.values.firstOrNull { findMsc(it) != null }
-        if (dev == null) { status = "ODD가 감지되지 않았어요. 허브를 쓰면 허브와 ODD 전원도 확인하세요."; return }
+        if (dev == null) { report("ODD가 감지되지 않았어요. 허브를 쓰면 허브와 ODD 전원도 확인하세요.", true); return }
         if (usb.hasPermission(dev)) open(dev)
         else {
-            status = "USB 권한 팝업에서 '허용'을 눌러 주세요"
+            report("USB 권한 팝업에서 '허용'을 눌러 주세요", false)
             val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERM).setPackage(packageName), PendingIntent.FLAG_MUTABLE)
             usb.requestPermission(dev, pi)
         }
@@ -122,25 +132,26 @@ class MainActivity : ComponentActivity() {
     private fun open(dev: UsbDevice) {
         if (current != null) return
         val m = findMsc(dev) ?: return
-        val c = usb.openDevice(dev) ?: run { status = "USB 장치를 열지 못했어요"; return }
-        if (!c.claimInterface(m.intf, true)) { c.close(); status = "USB 인터페이스를 점유하지 못했어요"; return }
+        val c = usb.openDevice(dev) ?: run { report("USB 장치를 열지 못했어요", true); return }
+        if (!c.claimInterface(m.intf, true)) { c.close(); report("USB 인터페이스를 점유하지 못했어요", true); return }
         conn = c
         current = dev
         engine.attach(Bot(c, m.epIn, m.epOut))
     }
 
     private fun detach() {
+        val had = current != null
         engine.detach()
         conn?.close()
         conn = null
         current = null
-        status = "ODD 연결이 끊어졌어요. 다시 연결해 주세요."
+        if (had) report("ODD 연결이 끊어졌어요. 다시 연결해 주세요.")
     }
 }
 
 private fun mmss(s: Int) = "%02d:%02d".format(maxOf(0, s) / 60, maxOf(0, s) % 60)
 
-private fun human(n: Long): String {
+internal fun human(n: Long): String {
     var v = n.toDouble()
     for (u in listOf("B", "KB", "MB", "GB")) {
         if (v < 1024 || u == "GB") return if (u == "B") "${v.toLong()}B" else "%.1f%s".format(v, u)
@@ -157,12 +168,17 @@ fun OddApp(
 ) {
     val s by engine.ui.collectAsState()
     var showSettings by remember { mutableStateOf(false) }
+    var showHelp by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(s.msg) { if (s.msg.isNotBlank()) snackbar.showSnackbar(s.msg) }
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold(topBar = {
-            TopAppBar(title = { Text("ODD 관리자") }, actions = {
+            TopAppBar(title = { Text("TheODDer") }, actions = {
+                IconButton(onClick = { showHelp = true }) { Icon(painterResource(R.drawable.ic_help), "도움말") }
                 IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "설정") }
             })
-        }) { pad ->
+        }, snackbarHost = { SnackbarHost(snackbar) }) { pad ->
             Column(Modifier.padding(pad).padding(horizontal = 16.dp).fillMaxSize()) {
                 if (!s.connected) {
                     Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
@@ -187,15 +203,16 @@ fun OddApp(
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
-                        TextButton(onClick = { engine.eject() }, enabled = !busy) { Text("꺼내기") }
-                        TextButton(onClick = { engine.load() }, enabled = !busy) { Text("넣기") }
+                        if (s.state != "ready") {   // 디스크가 열려 있으면 '작업' 메뉴의 꺼내기를 사용
+                            TextButton(onClick = { engine.eject() }, enabled = !busy) { Text("꺼내기") }
+                            TextButton(onClick = { engine.load() }, enabled = !busy) { Text("넣기") }
+                        }
                     }
                     s.job?.let { j ->
                         Text("${j.label}  ${j.pct}%", style = MaterialTheme.typography.bodySmall)
                         LinearProgressIndicator(progress = { j.pct / 100f }, modifier = Modifier.fillMaxWidth())
                         TextButton(onClick = { engine.cancel() }) { Text("취소") }
                     }
-                    if (s.msg.isNotBlank()) Text(s.msg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.height(8.dp))
                     if (s.state == "ready") when (s.kind) {
                         "audio" -> AudioPane(s, engine)
@@ -204,7 +221,9 @@ fun OddApp(
                 }
             }
         }
-        if (showSettings) SettingsDialog(cfg, outTree, onPickFolder) { showSettings = false }
+        if (showSettings) SettingsDialog(cfg, outTree, onPickFolder, onShowLog = { showLog = true }) { showSettings = false }
+        if (showLog) LogDialog { showLog = false }
+        if (showHelp) HelpDialog { showHelp = false }
     }
 }
 
@@ -212,80 +231,64 @@ fun OddApp(
 private fun AudioPane(s: UiState, engine: OddEngine) {
     val busy = s.job != null
     val curTrack = s.tracks.firstOrNull { it.no == s.cur }
-    Column(Modifier.fillMaxSize()) {
-        Text(s.album.ifBlank { "오디오 CD" }, style = MaterialTheme.typography.titleMedium)
-        if (s.artist.isNotBlank()) Text(s.artist, style = MaterialTheme.typography.bodyMedium)
-        LazyColumn(Modifier.weight(1f).padding(vertical = 8.dp)) {
-            itemsIndexed(s.tracks) { i, t ->
-                val sel = s.cur == t.no
-                Row(
-                    Modifier.fillMaxWidth().clickable(enabled = !busy) { engine.play(t.no) }
-                        .background(if (sel) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
-                        .padding(vertical = 10.dp, horizontal = 8.dp),
-                ) {
-                    Text("%02d".format(t.no), Modifier.width(32.dp))
-                    Text(
-                        s.titles.getOrNull(i)?.takeIf { it.isNotBlank() } ?: "트랙 ${t.no}",
-                        Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(mmss((t.end - t.start) / 75))
+    var showInfo by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            Text(s.album.ifBlank { "오디오 CD" }, style = MaterialTheme.typography.titleMedium)
+            if (s.artist.isNotBlank()) Text(s.artist, style = MaterialTheme.typography.bodyMedium)
+            LazyColumn(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                itemsIndexed(s.tracks) { i, t ->
+                    val sel = s.cur == t.no
+                    Row(
+                        Modifier.fillMaxWidth().clickable(enabled = !busy) { engine.play(t.no) }
+                            .background(if (sel) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                            .padding(vertical = 10.dp, horizontal = 8.dp),
+                    ) {
+                        Text("%02d".format(t.no), Modifier.width(32.dp))
+                        Text(
+                            s.titles.getOrNull(i)?.takeIf { it.isNotBlank() } ?: "트랙 ${t.no}",
+                            Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(mmss((t.end - t.start) / 75))
+                    }
                 }
             }
+            if (curTrack != null) {
+                val len = (curTrack.end - curTrack.start) / 75
+                LinearProgressIndicator(progress = { s.posSec / maxOf(len, 1).toFloat() }, modifier = Modifier.fillMaxWidth())
+                Text("${mmss(s.posSec)} / ${mmss(len)}", style = MaterialTheme.typography.bodySmall)
+            }
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
+                OutlinedButton({ engine.prev() }, enabled = !busy) { Text("이전") }
+                OutlinedButton({ engine.seekBy(-10) }, enabled = !busy) { Text("-10") }
+                Button({
+                    if (s.cur == null) s.tracks.firstOrNull()?.let { engine.play(it.no) } else engine.pause()
+                }, enabled = !busy) { Text(if (s.cur == null || s.paused) "재생" else "일시정지") }
+                OutlinedButton({ engine.seekBy(10) }, enabled = !busy) { Text("+10") }
+                OutlinedButton({ engine.next() }, enabled = !busy) { Text("다음") }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("볼륨", Modifier.padding(end = 8.dp))
+                Slider(s.volume.toFloat(), { engine.setVolume(it.toInt()) }, Modifier.weight(1f), valueRange = 0f..100f)
+                Text("반복", Modifier.padding(horizontal = 8.dp))
+                Switch(s.repeat, { engine.toggleRepeat() })
+            }
+            Spacer(Modifier.height(72.dp))   // 작업 버튼 자리
         }
-        if (curTrack != null) {
-            val len = (curTrack.end - curTrack.start) / 75
-            LinearProgressIndicator(progress = { s.posSec / maxOf(len, 1).toFloat() }, modifier = Modifier.fillMaxWidth())
-            Text("${mmss(s.posSec)} / ${mmss(len)}", style = MaterialTheme.typography.bodySmall)
-        }
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
-            OutlinedButton({ engine.prev() }, enabled = !busy) { Text("이전") }
-            OutlinedButton({ engine.seekBy(-10) }, enabled = !busy) { Text("-10") }
-            Button({
-                if (s.cur == null) s.tracks.firstOrNull()?.let { engine.play(it.no) } else engine.pause()
-            }, enabled = !busy) { Text(if (s.cur == null || s.paused) "재생" else "일시정지") }
-            OutlinedButton({ engine.seekBy(10) }, enabled = !busy) { Text("+10") }
-            OutlinedButton({ engine.next() }, enabled = !busy) { Text("다음") }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("볼륨", Modifier.padding(end = 8.dp))
-            Slider(s.volume.toFloat(), { engine.setVolume(it.toInt()) }, Modifier.weight(1f), valueRange = 0f..100f)
-            Text("반복", Modifier.padding(horizontal = 8.dp))
-            Switch(s.repeat, { engine.toggleRepeat() })
-        }
-        Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), Arrangement.spacedBy(8.dp)) {
-            OutlinedButton({ s.cur?.let { engine.rip(listOf(it)) } }, enabled = !busy && s.cur != null, modifier = Modifier.weight(1f)) { Text("현재 곡 리핑") }
-            OutlinedButton({ engine.rip(s.tracks.map { it.no }) }, enabled = !busy, modifier = Modifier.weight(1f)) { Text("전체 리핑") }
-        }
+        ActionMenu(
+            listOf(
+                ActionItem("현재 곡 리핑", !busy && s.cur != null) { s.cur?.let { engine.rip(listOf(it)) } },
+                ActionItem("전체 리핑", !busy) { engine.rip(s.tracks.map { it.no }) },
+                ActionItem("디스크 정보") { showInfo = true },
+                ActionItem("꺼내기", !busy) { engine.eject() },
+            ),
+        )
     }
+    if (showInfo) InfoDialog(s) { showInfo = false }
 }
 
 @Composable
-private fun DataPane(s: UiState, engine: OddEngine) {
-    val busy = s.job != null
-    Column(Modifier.fillMaxSize()) {
-        Text(s.label.ifBlank { "데이터 디스크" }, style = MaterialTheme.typography.titleMedium)
-        Text("${s.fs}  ${if (s.sizeMb > 0) "%.1fMB".format(s.sizeMb) else ""}", style = MaterialTheme.typography.bodySmall)
-        Text("/" + s.path.joinToString("/"), style = MaterialTheme.typography.bodySmall)
-        LazyColumn(Modifier.weight(1f).padding(vertical = 8.dp)) {
-            if (s.path.isNotEmpty()) item {
-                Text("..", Modifier.fillMaxWidth().clickable(enabled = !busy) { engine.up() }.padding(12.dp))
-            }
-            items(s.entries) { e ->
-                Row(Modifier.fillMaxWidth().clickable(enabled = !busy && e.isDir) { engine.open(e) }.padding(start = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (e.isDir) "▸ " else "   ")
-                    Text(e.name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (!e.isDir) Text(human(e.size), style = MaterialTheme.typography.bodySmall)
-                    TextButton({ engine.copy(e) }, enabled = !busy) { Text("복사") }
-                }
-            }
-        }
-        Button({ engine.dumpIso() }, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) { Text("디스크 전체 ISO 덤프") }
-    }
-}
-
-@Composable
-private fun SettingsDialog(cfg: Settings, outTree: String, onPickFolder: () -> Unit, onClose: () -> Unit) {
+private fun SettingsDialog(cfg: Settings, outTree: String, onPickFolder: () -> Unit, onShowLog: () -> Unit, onClose: () -> Unit) {
     var autoplay by remember { mutableStateOf(cfg.autoplay) }
     var lookup by remember { mutableStateOf(cfg.lookup) }
     var ps by remember { mutableStateOf(cfg.playSpeed) }
@@ -301,6 +304,8 @@ private fun SettingsDialog(cfg: Settings, outTree: String, onPickFolder: () -> U
                 TextButton(onPickFolder) {
                     Text(if (outTree.isBlank()) "앱 전용 폴더 (변경하려면 탭)" else Uri.parse(outTree).lastPathSegment ?: outTree)
                 }
+                Text("로그", style = MaterialTheme.typography.labelMedium)
+                TextButton(onShowLog) { Text("로그 보기") }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("오디오 CD 자동 재생", Modifier.weight(1f))
                     Switch(autoplay, { autoplay = it; cfg.autoplay = it })
