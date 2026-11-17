@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ODD 연결 시 앱 자동 실행. 서브클래스 2(MMC) / 6(SCSI) -->
+<resources>
+    <usb-device class="8" subclass="2" />
+    <usb-device class="8" subclass="6" />
+</resources>
