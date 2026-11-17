@@ -36,6 +36,7 @@ data class UiState(
     val fs: String = "", val label: String = "", val sizeMb: Double = 0.0,
     val path: List<String> = emptyList(), val entries: List<IsoEntry> = emptyList(),
     val job: JobUi? = null, val msg: String = "",
+    val resume: ResumeInfo? = null,   // 이어듣기 질문 (null 이면 없음)
 )
 
 private val BAD_CHARS = Regex("""[\\/:*?"<>|\u0000-\u001f]""")
@@ -63,6 +64,7 @@ private sealed interface Cmd {
     data object Next : Cmd
     data object Prev : Cmd
     data class SeekBy(val d: Int) : Cmd
+    data class Resume(val accept: Boolean) : Cmd
     data object Eject : Cmd
     data object Load : Cmd
     data class Open(val e: IsoEntry) : Cmd
@@ -108,6 +110,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
     fun prev() = send(Cmd.Prev)
     fun seekBy(d: Int) = send(Cmd.SeekBy(d))
     fun eject() = send(Cmd.Eject)
+    fun resume(accept: Boolean) = send(Cmd.Resume(accept))
     fun load() = send(Cmd.Load)
     fun open(e: IsoEntry) = send(Cmd.Open(e))
     fun up() = send(Cmd.Up)
@@ -152,6 +155,9 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
         private var lastPos = 0L
         private var lastProg = 0L
         private var lastState = ""
+        private var discId = ""
+        private var lastSave = 0L
+        private var lastSaved = ""
 
         fun start() = th.start()
         fun stop() { alive = false; cancel = true; q.offer(Cmd.Quit) }
@@ -257,7 +263,26 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                         return true
                     }
                 }
-                Cmd.Eject -> { runCatching { bot.eject() }; dropDisc("nodisc"); return true }
+                is Cmd.Resume -> {
+                    val r = _ui.value.resume
+                    post { it.copy(resume = null) }
+                    if (mode == "audio" && r != null) {
+                        if (c.accept) {
+                            val k = aud.indexOfFirst { it.no == r.trackNo }
+                            if (k >= 0) {
+                                val len = (aud[k].end - aud[k].start) / 75
+                                AppLog.i("이어듣기: 트랙 ${r.trackNo} ${r.posSec}초부터")
+                                flushAudio(); startTrack(k, r.posSec.coerceIn(0, maxOf(0, len - 1)))
+                                return true
+                            }
+                        } else {
+                            ResumeStore.clear(ctx)
+                            AppLog.i("이어듣기 기록 삭제")
+                            if (cfg.autoplay) { flushAudio(); startTrack(0); return true }
+                        }
+                    }
+                }
+                Cmd.Eject -> { ResumeStore.clear(ctx); runCatching { bot.eject() }; dropDisc("nodisc"); return true }
                 Cmd.Load -> { runCatching { bot.load() }; dropDisc("loading"); return true }
                 is Cmd.Open -> if (mode == "data" && c.e.isDir) { stack.add(c.e); showDir() }
                 Cmd.Up -> if (mode == "data" && stack.size > 1) { stack.removeLast(); showDir() }
@@ -282,7 +307,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             post {
                 it.copy(state = state, kind = "", tracks = emptyList(), media = "", album = "", artist = "",
                     titles = emptyList(), cur = null, posSec = 0, paused = false, fs = "", label = "",
-                    sizeMb = 0.0, path = emptyList(), entries = emptyList(), job = null)
+                    sizeMb = 0.0, path = emptyList(), entries = emptyList(), job = null, resume = null)
             }
         }
 
@@ -306,6 +331,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 lastState = "ready"
                 AppLog.i("오디오 CD 인식: ${tracks.size}트랙" + if (media.isNotBlank()) " · $media" else "")
                 val id = MusicBrainz.discId(toc, leadout)
+                discId = id
                 net.execute {
                     val r = MusicBrainz.get(ctx, id, tracks.size, cfg.lookup)
                     if (r != null) {
@@ -315,7 +341,22 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                         AppLog.i(if (cfg.lookup) "앨범 정보 없음 (MusicBrainz)" else "앨범 정보 조회 꺼짐")
                     }
                 }
-                if (cfg.autoplay) startTrack(0)
+                val saved = ResumeStore.load(ctx, id)?.takeIf { r ->
+                    tracks.any { it.no == r.trackNo } && (r.posSec >= 5 || r.trackNo != tracks.first().no)
+                }
+                if (saved != null) {
+                    AppLog.i("이어듣기 기록 발견: 트랙 ${saved.trackNo} · ${saved.posSec}초")
+                    if (cfg.autoResume) {
+                        val k = tracks.indexOfFirst { it.no == saved.trackNo }
+                        val len = (tracks[k].end - tracks[k].start) / 75
+                        AppLog.i("자동 이어듣기: 트랙 ${saved.trackNo} · ${saved.posSec}초부터")
+                        startTrack(k, saved.posSec.coerceIn(0, maxOf(0, len - 1)))
+                    } else {
+                        post { it.copy(resume = saved) }
+                    }
+                } else if (cfg.autoplay) {
+                    startTrack(0)
+                }
             } else {
                 val info = Iso.open(bot, toc[0].lba.toLong())
                 charset = info.charset
@@ -372,10 +413,18 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             while (segs.size > 1 && segs[1].start <= played) segs.removeFirst()
             val s = segs.firstOrNull()
             if (s == null || (!playing && played >= w)) {
-                if (_ui.value.cur != null) { segs.clear(); post { it.copy(cur = null, posSec = 0, paused = false) } }
+                if (_ui.value.cur != null) {
+                    segs.clear(); ResumeStore.clear(ctx)   // 끝까지 들었으면 기록 삭제
+                    post { it.copy(cur = null, posSec = 0, paused = false) }
+                }
                 return
             }
             val sec = s.off + (maxOf(0L, played - s.start) / 44100).toInt()
+            if (mode == "audio" && discId.isNotEmpty() && n - lastSave > 5000) {   // 5초마다 위치 저장
+                lastSave = n
+                val key = "${aud[s.idx].no}:$sec"
+                if (key != lastSaved) { lastSaved = key; ResumeStore.save(ctx, discId, aud[s.idx].no, sec) }
+            }
             post { it.copy(cur = aud[s.idx].no, posSec = sec) }
         }
 

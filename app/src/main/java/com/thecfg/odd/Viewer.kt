@@ -9,11 +9,13 @@ import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -21,6 +23,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -112,13 +115,20 @@ private fun openEntry(ctx: Context, e: IsoEntry, scope: CoroutineScope, show: (V
 }
 
 @Composable
-fun DataPane(s: UiState, engine: OddEngine) {
+fun DataPane(s: UiState, engine: OddEngine, nav: UiNav) {
     val busy = s.job != null
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var viewing by remember { mutableStateOf<Viewing?>(null) }
-    var showInfo by remember { mutableStateOf(false) }
     val browsable = !s.fs.contains("아님")
+    val listState = rememberLazyListState()
+    val offset = if (s.path.isNotEmpty()) 1 else 0   // '..' 줄
+
+    LaunchedEffect(s.entries) { nav.cursor = -1 }
+    LaunchedEffect(nav.cursor) { if (nav.cursor >= 0) listState.animateScrollToItem(nav.cursor + offset) }
+    LaunchedEffect(nav.pendingOpen) {
+        nav.pendingOpen?.let { e -> nav.pendingOpen = null; openEntry(ctx, e, scope) { viewing = it } }
+    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
@@ -128,14 +138,16 @@ fun DataPane(s: UiState, engine: OddEngine) {
             Text("파일을 탭하면 바로 열려요. '파일' 앱의 ODD 항목으로도 접근할 수 있어요.", style = MaterialTheme.typography.labelSmall)
             LazyColumn(
                 Modifier.weight(1f).padding(top = 8.dp),
+                state = listState,
                 contentPadding = PaddingValues(bottom = 88.dp),   // 작업 버튼에 가리지 않게
             ) {
                 if (s.path.isNotEmpty()) item {
                     Text("..", Modifier.fillMaxWidth().clickable(enabled = !busy) { engine.up() }.padding(12.dp))
                 }
-                items(s.entries) { e ->
+                itemsIndexed(s.entries) { i, e ->
                     Row(
                         Modifier.fillMaxWidth()
+                            .background(if (i == nav.cursor) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
                             .clickable(enabled = !busy) {
                                 if (e.isDir) engine.open(e) else openEntry(ctx, e, scope) { viewing = it }
                             }
@@ -154,7 +166,7 @@ fun DataPane(s: UiState, engine: OddEngine) {
             listOf(
                 ActionItem("ISO로 저장", !busy) { engine.dumpIso() },
                 ActionItem("전체 파일 복사", !busy && browsable) { engine.copyAll() },
-                ActionItem("디스크 정보") { showInfo = true },
+                ActionItem("디스크 정보") { nav.showInfo = true },
                 ActionItem("꺼내기", !busy) { engine.eject() },
             ),
         )
@@ -163,7 +175,6 @@ fun DataPane(s: UiState, engine: OddEngine) {
     viewing?.let { v ->
         ViewerDialog(v, onExternal = { openExternal(ctx, v.e) }, onClose = { viewing = null })
     }
-    if (showInfo) InfoDialog(s) { showInfo = false }
 }
 
 @Composable

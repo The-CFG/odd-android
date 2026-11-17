@@ -11,6 +11,7 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var engine: OddEngine
     private var conn: UsbDeviceConnection? = null
     private var current: UsbDevice? = null
+    private val nav = UiNav()
     private var status by mutableStateOf("")
     private var outTree by mutableStateOf("")
 
@@ -89,8 +91,13 @@ class MainActivity : ComponentActivity() {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         ContextCompat.registerReceiver(this, receiver, f, ContextCompat.RECEIVER_NOT_EXPORTED)
-        setContent { OddApp(engine, cfg, status, outTree, { picker.launch(null) }, { scan() }) }
+        setContent { OddApp(engine, cfg, status, outTree, nav, { picker.launch(null) }, { scan() }) }
         scan()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (event != null && handleKey(nav, engine, keyCode, event) { finish() }) return true
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -163,20 +170,17 @@ internal fun human(n: Long): String {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OddApp(
-    engine: OddEngine, cfg: Settings, status: String, outTree: String,
+    engine: OddEngine, cfg: Settings, status: String, outTree: String, nav: UiNav,
     onPickFolder: () -> Unit, onRescan: () -> Unit,
 ) {
     val s by engine.ui.collectAsState()
-    var showSettings by remember { mutableStateOf(false) }
-    var showHelp by remember { mutableStateOf(false) }
-    var showLog by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(s.msg) { if (s.msg.isNotBlank()) snackbar.showSnackbar(s.msg) }
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold(topBar = {
             TopAppBar(title = { Text("TheODDer") }, actions = {
-                IconButton(onClick = { showHelp = true }) { Icon(painterResource(R.drawable.ic_help), "도움말") }
-                IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "설정") }
+                IconButton(onClick = { nav.showHelp = true }) { Icon(painterResource(R.drawable.ic_help), "도움말") }
+                IconButton(onClick = { nav.showSettings = true }) { Icon(Icons.Default.Settings, "설정") }
             })
         }, snackbarHost = { SnackbarHost(snackbar) }) { pad ->
             Column(Modifier.padding(pad).padding(horizontal = 16.dp).fillMaxSize()) {
@@ -215,23 +219,33 @@ fun OddApp(
                     }
                     Spacer(Modifier.height(8.dp))
                     if (s.state == "ready") when (s.kind) {
-                        "audio" -> AudioPane(s, engine)
-                        "data" -> DataPane(s, engine)
+                        "audio" -> AudioPane(s, engine, nav)
+                        "data" -> DataPane(s, engine, nav)
                     }
                 }
             }
         }
-        if (showSettings) SettingsDialog(cfg, outTree, onPickFolder, onShowLog = { showLog = true }) { showSettings = false }
-        if (showLog) LogDialog { showLog = false }
-        if (showHelp) HelpDialog { showHelp = false }
+        if (nav.showSettings) SettingsDialog(cfg, outTree, onPickFolder, onShowLog = { nav.showLog = true }) { nav.showSettings = false }
+        if (nav.showLog) LogDialog { nav.showLog = false }
+        if (nav.showInfo) InfoDialog(s) { nav.showInfo = false }
+        if (nav.jump != null) JumpDialog(s, nav, engine)
+        s.resume?.let { r ->
+            AlertDialog(
+                onDismissRequest = { engine.resume(false) },
+                title = { Text("이어서 들을까요?") },
+                text = { Text("트랙 ${r.trackNo}, ${mmss(r.posSec)} 지점까지 재생한 기록이 있어요.\n그 위치부터 이어서 재생할까요?") },
+                confirmButton = { TextButton(onClick = { engine.resume(true) }) { Text("이어서 재생") } },
+                dismissButton = { TextButton(onClick = { engine.resume(false) }) { Text("아니요") } },
+            )
+        }
+        if (nav.showHelp) HelpDialog { nav.showHelp = false }
     }
 }
 
 @Composable
-private fun AudioPane(s: UiState, engine: OddEngine) {
+private fun AudioPane(s: UiState, engine: OddEngine, nav: UiNav) {
     val busy = s.job != null
     val curTrack = s.tracks.firstOrNull { it.no == s.cur }
-    var showInfo by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             Text(s.album.ifBlank { "오디오 CD" }, style = MaterialTheme.typography.titleMedium)
@@ -279,17 +293,17 @@ private fun AudioPane(s: UiState, engine: OddEngine) {
             listOf(
                 ActionItem("현재 곡 리핑", !busy && s.cur != null) { s.cur?.let { engine.rip(listOf(it)) } },
                 ActionItem("전체 리핑", !busy) { engine.rip(s.tracks.map { it.no }) },
-                ActionItem("디스크 정보") { showInfo = true },
+                ActionItem("디스크 정보") { nav.showInfo = true },
                 ActionItem("꺼내기", !busy) { engine.eject() },
             ),
         )
     }
-    if (showInfo) InfoDialog(s) { showInfo = false }
 }
 
 @Composable
 private fun SettingsDialog(cfg: Settings, outTree: String, onPickFolder: () -> Unit, onShowLog: () -> Unit, onClose: () -> Unit) {
     var autoplay by remember { mutableStateOf(cfg.autoplay) }
+    var autoResume by remember { mutableStateOf(cfg.autoResume) }
     var lookup by remember { mutableStateOf(cfg.lookup) }
     var ps by remember { mutableStateOf(cfg.playSpeed) }
     var rs by remember { mutableStateOf(cfg.ripSpeed) }
@@ -309,6 +323,10 @@ private fun SettingsDialog(cfg: Settings, outTree: String, onPickFolder: () -> U
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("오디오 CD 자동 재생", Modifier.weight(1f))
                     Switch(autoplay, { autoplay = it; cfg.autoplay = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("전원 재설정 후 자동으로 이어서 재생", Modifier.weight(1f))
+                    Switch(autoResume, { autoResume = it; cfg.autoResume = it })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("앨범 정보 온라인 조회", Modifier.weight(1f))

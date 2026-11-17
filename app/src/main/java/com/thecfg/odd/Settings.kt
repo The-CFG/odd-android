@@ -12,6 +12,9 @@ class Settings(ctx: Context) {
     var autoplay: Boolean
         get() = p.getBoolean("autoplay", false)
         set(v) { p.edit().putBoolean("autoplay", v).apply() }
+    var autoResume: Boolean   // 전원 재설정 후 같은 디스크가 인식되면 묻지 않고 저장된 위치부터 재생
+        get() = p.getBoolean("autoResume", false)
+        set(v) { p.edit().putBoolean("autoResume", v).apply() }
     var lookup: Boolean
         get() = p.getBoolean("lookup", true)
         set(v) { p.edit().putBoolean("lookup", v).apply() }
