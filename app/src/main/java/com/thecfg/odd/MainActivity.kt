@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var usb: UsbManager
     private lateinit var cfg: Settings
     private lateinit var engine: OddEngine
+    private lateinit var image: ImageEngine
     private var conn: UsbDeviceConnection? = null
     private var current: UsbDevice? = null
     private val nav = UiNav()
@@ -57,6 +58,19 @@ class MainActivity : ComponentActivity() {
             cfg.outTree = uri.toString()
             outTree = cfg.outTree
         }
+    }
+
+    private val isoPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) image.openUri(uri)
+    }
+
+    private fun openIsoPicker() = isoPicker.launch(arrayOf("*/*"))
+
+    /** 파일 관리 앱에서 .iso 를 'TheODDer 로 열기' 한 경우 */
+    private fun handleViewIntent(i: Intent?) {
+        if (i == null || i.action != Intent.ACTION_VIEW) return
+        if ((i.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return
+        i.data?.let { image.openUri(it) }
     }
 
     private val receiver = object : BroadcastReceiver() {
@@ -83,6 +97,7 @@ class MainActivity : ComponentActivity() {
         AppLog.init(applicationContext)
         AppLog.i("앱 시작")
         engine = OddEngine(applicationContext, cfg)
+        image = ImageEngine(applicationContext, cfg, engine)
         outTree = cfg.outTree
         status = "ODD를 USB로 연결해 주세요"
         val f = IntentFilter().apply {
@@ -91,18 +106,20 @@ class MainActivity : ComponentActivity() {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         ContextCompat.registerReceiver(this, receiver, f, ContextCompat.RECEIVER_NOT_EXPORTED)
-        setContent { OddApp(engine, cfg, status, outTree, nav, { picker.launch(null) }, { scan() }) }
+        setContent { OddApp(engine, image, cfg, status, outTree, nav, { picker.launch(null) }, { scan() }, { openIsoPicker() }) }
         scan()
+        handleViewIntent(intent)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (event != null && handleKey(nav, engine, keyCode, event) { finish() }) return true
+        if (event != null && handleKey(nav, engine, image, keyCode, event, { openIsoPicker() }) { finish() }) return true
         return super.onKeyDown(keyCode, event)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         scan()
+        handleViewIntent(intent)
     }
 
     override fun onResume() {
@@ -113,6 +130,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         unregisterReceiver(receiver)
         detach()
+        image.release()
         engine.release()
         super.onDestroy()
     }
@@ -170,12 +188,14 @@ internal fun human(n: Long): String {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OddApp(
-    engine: OddEngine, cfg: Settings, status: String, outTree: String, nav: UiNav,
-    onPickFolder: () -> Unit, onRescan: () -> Unit,
+    engine: OddEngine, image: ImageEngine, cfg: Settings, status: String, outTree: String, nav: UiNav,
+    onPickFolder: () -> Unit, onRescan: () -> Unit, onOpenIso: () -> Unit,
 ) {
     val s by engine.ui.collectAsState()
+    val img by image.ui.collectAsState()
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(s.msg) { if (s.msg.isNotBlank()) snackbar.showSnackbar(s.msg) }
+    LaunchedEffect(img.msg) { if (img.msg.isNotBlank()) snackbar.showSnackbar(img.msg) }
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold(topBar = {
             TopAppBar(title = { Text("TheODDer") }, actions = {
@@ -184,11 +204,16 @@ fun OddApp(
             })
         }, snackbarHost = { SnackbarHost(snackbar) }) { pad ->
             Column(Modifier.padding(pad).padding(horizontal = 16.dp).fillMaxSize()) {
-                if (!s.connected) {
+                if (img.state.isNotEmpty()) {   // ISO 파일을 여는 중이거나 보는 중
+                    if (img.state == "ready") ImageScreen(img, image, nav)
+                    else Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) { CircularProgressIndicator() }
+                } else if (!s.connected) {
                     Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
                         Text(status)
                         Spacer(Modifier.height(12.dp))
                         Button(onClick = onRescan) { Text("다시 찾기") }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(onClick = onOpenIso) { Text("ISO 파일 열기") }
                     }
                 } else {
                     val busy = s.job != null
@@ -207,6 +232,7 @@ fun OddApp(
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
+                        TextButton(onClick = onOpenIso, enabled = !busy) { Text("ISO 열기") }
                         if (s.state != "ready") {   // 디스크가 열려 있으면 '작업' 메뉴의 꺼내기를 사용
                             TextButton(onClick = { engine.eject() }, enabled = !busy) { Text("꺼내기") }
                             TextButton(onClick = { engine.load() }, enabled = !busy) { Text("넣기") }
@@ -227,7 +253,8 @@ fun OddApp(
         }
         if (nav.showSettings) SettingsDialog(cfg, outTree, onPickFolder, onShowLog = { nav.showLog = true }) { nav.showSettings = false }
         if (nav.showLog) LogDialog { nav.showLog = false }
-        if (nav.showInfo) InfoDialog(s) { nav.showInfo = false }
+        if (nav.showInfo) InfoDialog(if (img.state.isNotEmpty()) img else s) { nav.showInfo = false }
+        if (nav.showMeta && s.kind == "audio") MetaEditDialog(s, engine) { nav.showMeta = false }
         if (nav.jump != null) JumpDialog(s, nav, engine)
         s.resume?.let { r ->
             AlertDialog(
@@ -250,6 +277,7 @@ private fun AudioPane(s: UiState, engine: OddEngine, nav: UiNav) {
         Column(Modifier.fillMaxSize()) {
             Text(s.album.ifBlank { "오디오 CD" }, style = MaterialTheme.typography.titleMedium)
             if (s.artist.isNotBlank()) Text(s.artist, style = MaterialTheme.typography.bodyMedium)
+            if (s.customized) Text("직접 입력한 정보", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
             LazyColumn(Modifier.weight(1f).padding(vertical = 8.dp)) {
                 itemsIndexed(s.tracks) { i, t ->
                     val sel = s.cur == t.no
@@ -293,6 +321,7 @@ private fun AudioPane(s: UiState, engine: OddEngine, nav: UiNav) {
             listOf(
                 ActionItem("현재 곡 리핑", !busy && s.cur != null) { s.cur?.let { engine.rip(listOf(it)) } },
                 ActionItem("전체 리핑", !busy) { engine.rip(s.tracks.map { it.no }) },
+                ActionItem("정보 편집", !busy) { nav.showMeta = true },
                 ActionItem("디스크 정보") { nav.showInfo = true },
                 ActionItem("꺼내기", !busy) { engine.eject() },
             ),

@@ -20,6 +20,7 @@ class UiNav {
     var showHelp by mutableStateOf(false)
     var showLog by mutableStateOf(false)
     var showInfo by mutableStateOf(false)
+    var showMeta by mutableStateOf(false)
     var jump by mutableStateOf<String?>(null)            // 곡 번호 입력창 (null 이면 닫힘)
     var cursor by mutableIntStateOf(-1)                   // 데이터 디스크 목록 커서 (-1: 없음)
     var pendingOpen by mutableStateOf<IsoEntry?>(null)    // 키보드로 연 파일 → DataPane 이 처리
@@ -27,15 +28,28 @@ class UiNav {
 
 /**
  * odd.py 와 같은 단축키 (하드웨어 키보드 / 미디어 키).
- * 공통: q 종료, e 꺼내기, l 넣기, d 디스크 정보, s 설정
- * 오디오: Space 재생/일시정지, n/p 다음/이전, ←/→ ±10초, ↑/↓ 볼륨, = 곡 번호 이동, r 반복, x 현재 곡 리핑, a 전체 리핑
+ * 공통: q 종료, e 꺼내기, l 넣기, d 디스크 정보, s 설정, o ISO 파일 열기
+ * 오디오: Space 재생/일시정지, n/p 다음/이전, ←/→ ±10초, ↑/↓ 볼륨, = 곡 번호 이동, r 반복, x 현재 곡 리핑, a 전체 리핑, t 정보 편집
  * 데이터: ↑/↓ 커서, →/Enter 열기, ←/Backspace 상위 폴더, c 복사, i ISO 저장
  */
-fun handleKey(nav: UiNav, engine: OddEngine, keyCode: Int, ev: KeyEvent, quit: () -> Unit): Boolean {
+fun handleKey(
+    nav: UiNav, engine: OddEngine, image: ImageEngine, keyCode: Int, ev: KeyEvent,
+    openIso: () -> Unit, quit: () -> Unit,
+): Boolean {
     if (ev.isCtrlPressed || ev.isAltPressed || ev.isMetaPressed) return false
     val first = ev.repeatCount == 0
     val s = engine.ui.value
     if (keyCode == KeyEvent.KEYCODE_Q) { if (first) quit(); return true }
+    if (keyCode == KeyEvent.KEYCODE_O) { if (first) openIso(); return true }
+    val img = image.ui.value
+    if (img.state == "ready") {   // ISO 파일을 보는 중
+        when (keyCode) {
+            KeyEvent.KEYCODE_E -> { if (first) image.eject(); return true }
+            KeyEvent.KEYCODE_S -> { if (first) nav.showSettings = true; return true }
+            KeyEvent.KEYCODE_D -> { if (first) nav.showInfo = true; return true }
+        }
+        return if (img.job == null) dataKey(nav, image, img, keyCode, first) else false
+    }
     if (!s.connected) return false
     when (keyCode) {
         KeyEvent.KEYCODE_E -> { if (first) engine.eject(); return true }
@@ -69,11 +83,12 @@ private fun audioKey(nav: UiNav, engine: OddEngine, s: UiState, k: Int, first: B
         KeyEvent.KEYCODE_R -> { if (first) engine.toggleRepeat(); return true }
         KeyEvent.KEYCODE_X -> { if (first) s.cur?.let { engine.rip(listOf(it)) }; return true }
         KeyEvent.KEYCODE_A -> { if (first) engine.rip(s.tracks.map { it.no }); return true }
+        KeyEvent.KEYCODE_T -> { if (first) nav.showMeta = true; return true }
     }
     return false
 }
 
-private fun dataKey(nav: UiNav, engine: OddEngine, s: UiState, k: Int, first: Boolean): Boolean {
+private fun dataKey(nav: UiNav, engine: DataActions, s: UiState, k: Int, first: Boolean): Boolean {
     val n = s.entries.size
     val cur = nav.cursor
     val sel = if (cur >= 0) s.entries.getOrNull(cur) else null

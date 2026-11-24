@@ -115,7 +115,7 @@ private fun openEntry(ctx: Context, e: IsoEntry, scope: CoroutineScope, show: (V
 }
 
 @Composable
-fun DataPane(s: UiState, engine: OddEngine, nav: UiNav) {
+fun DataPane(s: UiState, engine: DataActions, nav: UiNav) {
     val busy = s.job != null
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -132,7 +132,8 @@ fun DataPane(s: UiState, engine: OddEngine, nav: UiNav) {
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            Text(s.label.ifBlank { "데이터 디스크" }, style = MaterialTheme.typography.titleMedium)
+            Text(s.label.ifBlank { if (engine.isImage) "ISO 이미지" else "데이터 디스크" }, style = MaterialTheme.typography.titleMedium)
+            if (engine.isImage && s.media.isNotBlank()) Text(s.media, style = MaterialTheme.typography.bodySmall)
             Text("${s.fs}  ${if (s.sizeMb > 0) "%.1fMB".format(s.sizeMb) else ""}", style = MaterialTheme.typography.bodySmall)
             Text("/" + s.path.joinToString("/"), style = MaterialTheme.typography.bodySmall)
             Text("파일을 탭하면 바로 열려요. '파일' 앱의 ODD 항목으로도 접근할 수 있어요.", style = MaterialTheme.typography.labelSmall)
@@ -163,12 +164,12 @@ fun DataPane(s: UiState, engine: OddEngine, nav: UiNav) {
             }
         }
         ActionMenu(
-            listOf(
-                ActionItem("ISO로 저장", !busy) { engine.dumpIso() },
-                ActionItem("전체 파일 복사", !busy && browsable) { engine.copyAll() },
-                ActionItem("디스크 정보") { nav.showInfo = true },
-                ActionItem("꺼내기", !busy) { engine.eject() },
-            ),
+            buildList<ActionItem> {
+                if (!engine.isImage) add(ActionItem("ISO로 저장", !busy) { engine.dumpIso() })
+                add(ActionItem("전체 파일 복사", !busy && browsable) { engine.copyAll() })
+                add(ActionItem("디스크 정보") { nav.showInfo = true })
+                add(ActionItem(if (engine.isImage) "ISO 닫기" else "꺼내기", !busy) { engine.eject() })
+            },
         )
     }
 

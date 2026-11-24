@@ -37,6 +37,7 @@ data class UiState(
     val path: List<String> = emptyList(), val entries: List<IsoEntry> = emptyList(),
     val job: JobUi? = null, val msg: String = "",
     val resume: ResumeInfo? = null,   // 이어듣기 질문 (null 이면 없음)
+    val customized: Boolean = false,  // 앨범/곡 정보를 직접 입력함
 )
 
 private val BAD_CHARS = Regex("""[\\/:*?"<>|\u0000-\u001f]""")
@@ -49,10 +50,10 @@ private fun wavHeader(size: Int): ByteArray =
         put("data".toByteArray()); putInt(size)
     }.array()
 
-private fun child(dir: DocumentFile, name: String): DocumentFile =
+internal fun child(dir: DocumentFile, name: String): DocumentFile =
     dir.findFile(name)?.takeIf { it.isDirectory } ?: dir.createDirectory(name) ?: throw IOException("폴더 생성 실패: $name")
 
-private fun newFile(dir: DocumentFile, name: String, mime: String): DocumentFile {
+internal fun newFile(dir: DocumentFile, name: String, mime: String): DocumentFile {
     dir.findFile(name)?.delete()
     return dir.createFile(mime, name) ?: throw IOException("파일 생성 실패: $name")
 }
@@ -64,8 +65,11 @@ private sealed interface Cmd {
     data object Next : Cmd
     data object Prev : Cmd
     data class SeekBy(val d: Int) : Cmd
+    data class SaveMeta(val album: String, val artist: String, val titles: List<String>) : Cmd
+    data object ResetMeta : Cmd
     data class Resume(val accept: Boolean) : Cmd
     data object Eject : Cmd
+    data object Republish : Cmd
     data object Load : Cmd
     data class Open(val e: IsoEntry) : Cmd
     data object Up : Cmd
@@ -81,7 +85,7 @@ private class Seg(val start: Long, val idx: Int, val off: Int)
  * odd.py 의 리더 데몬 + 컨트롤러 로직.
  * USB 전담 워커 스레드 하나가 명령 큐를 처리하고, 상태는 StateFlow 로 UI 에 내보낸다.
  */
-class OddEngine(private val ctx: Context, private val cfg: Settings) {
+class OddEngine(private val ctx: Context, private val cfg: Settings) : DataActions {
     private val _ui = MutableStateFlow(UiState(volume = cfg.volume, repeat = cfg.repeat))
     val ui: StateFlow<UiState> = _ui
     private val net = Executors.newSingleThreadExecutor()
@@ -109,15 +113,18 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
     fun next() = send(Cmd.Next)
     fun prev() = send(Cmd.Prev)
     fun seekBy(d: Int) = send(Cmd.SeekBy(d))
-    fun eject() = send(Cmd.Eject)
+    override fun eject() = send(Cmd.Eject)
+    fun refreshHub() = send(Cmd.Republish)   // ISO 파일을 닫은 뒤 물리 디스크를 '파일' 앱에 다시 노출
     fun resume(accept: Boolean) = send(Cmd.Resume(accept))
+    fun saveMeta(album: String, artist: String, titles: List<String>) = send(Cmd.SaveMeta(album, artist, titles))
+    fun resetMeta() = send(Cmd.ResetMeta)
     fun load() = send(Cmd.Load)
-    fun open(e: IsoEntry) = send(Cmd.Open(e))
-    fun up() = send(Cmd.Up)
+    override fun open(e: IsoEntry) = send(Cmd.Open(e))
+    override fun up() = send(Cmd.Up)
     fun rip(nos: List<Int>) = send(Cmd.Rip(nos))
-    fun copy(e: IsoEntry) = send(Cmd.Copy(e))
-    fun copyAll() = send(Cmd.CopyAll)
-    fun dumpIso() = send(Cmd.Dump)
+    override fun copy(e: IsoEntry) = send(Cmd.Copy(e))
+    override fun copyAll() = send(Cmd.CopyAll)
+    override fun dumpIso() = send(Cmd.Dump)
     fun cancel() { session?.cancel = true }
 
     fun setVolume(v: Int) {
@@ -263,6 +270,30 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                         return true
                     }
                 }
+                Cmd.Republish -> if (mode == "data") {
+                    stack.firstOrNull()?.let { OddHub.publish(ctx, bot, it, charset, _ui.value.label) }
+                }
+                is Cmd.SaveMeta -> if (mode == "audio" && discId.isNotEmpty()) {
+                    val n = aud.size
+                    val auto = MusicBrainz.get(ctx, discId, n, false)
+                    // 자동 정보와 같은 칸은 '직접 입력 안 함'(빈 칸)으로 저장 → 나중에 자동 정보가 좋아지면 그대로 반영
+                    fun diff(typed: String, a: String?) = typed.trim().let { if (it == (a ?: "")) "" else it }
+                    val custom = CdInfo(
+                        diff(c.album, auto?.album), diff(c.artist, auto?.artist),
+                        (0 until n).map { diff(c.titles.getOrNull(it) ?: "", auto?.titles?.getOrNull(it)) },
+                    )
+                    val empty = custom.album.isBlank() && custom.artist.isBlank() && custom.titles.all { it.isBlank() }
+                    if (empty) CustomMeta.clear(ctx, discId) else CustomMeta.save(ctx, discId, custom)
+                    val m = CustomMeta.merge(if (empty) null else custom, auto, n)
+                    AppLog.i(if (empty) "직접 입력한 정보 없음 (자동 정보 사용)" else "앨범/곡 정보를 직접 입력해 저장함")
+                    post { it.copy(album = m.album, artist = m.artist, titles = m.titles, customized = !empty) }
+                }
+                Cmd.ResetMeta -> if (mode == "audio" && discId.isNotEmpty()) {
+                    CustomMeta.clear(ctx, discId)
+                    val m = CustomMeta.merge(null, MusicBrainz.get(ctx, discId, aud.size, false), aud.size)
+                    AppLog.i("직접 입력한 정보를 초기화함")
+                    post { it.copy(album = m.album, artist = m.artist, titles = m.titles, customized = false) }
+                }
                 is Cmd.Resume -> {
                     val r = _ui.value.resume
                     post { it.copy(resume = null) }
@@ -307,7 +338,7 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
             post {
                 it.copy(state = state, kind = "", tracks = emptyList(), media = "", album = "", artist = "",
                     titles = emptyList(), cur = null, posSec = 0, paused = false, fs = "", label = "",
-                    sizeMb = 0.0, path = emptyList(), entries = emptyList(), job = null, resume = null)
+                    sizeMb = 0.0, path = emptyList(), entries = emptyList(), job = null, resume = null, customized = false)
             }
         }
 
@@ -332,11 +363,16 @@ class OddEngine(private val ctx: Context, private val cfg: Settings) {
                 AppLog.i("오디오 CD 인식: ${tracks.size}트랙" + if (media.isNotBlank()) " · $media" else "")
                 val id = MusicBrainz.discId(toc, leadout)
                 discId = id
+                CustomMeta.get(ctx, id)?.let { c ->   // 직접 입력한 정보가 있으면 먼저 적용
+                    val m = CustomMeta.merge(c, null, tracks.size)
+                    post { it.copy(album = m.album, artist = m.artist, titles = m.titles, customized = true) }
+                }
                 net.execute {
                     val r = MusicBrainz.get(ctx, id, tracks.size, cfg.lookup)
                     if (r != null) {
                         AppLog.i("앨범 정보: ${r.album.ifBlank { "(제목 없음)" }}")
-                        post { if (it.tracks == tracks) it.copy(album = r.album, artist = r.artist, titles = r.titles) else it }
+                        val m = CustomMeta.merge(CustomMeta.get(ctx, id), r, tracks.size)   // 직접 입력한 값이 우선
+                        post { if (it.tracks == tracks) it.copy(album = m.album, artist = m.artist, titles = m.titles) else it }
                     } else {
                         AppLog.i(if (cfg.lookup) "앨범 정보 없음 (MusicBrainz)" else "앨범 정보 조회 꺼짐")
                     }

@@ -46,7 +46,7 @@ private val PROFILE_NAMES = mapOf(
 )
 
 /** USB Bulk-Only Transport 위의 SCSI/MMC 명령 (odd.py 의 BOT 클래스 포팅) */
-class Bot(private val conn: UsbDeviceConnection, private val epIn: UsbEndpoint, private val epOut: UsbEndpoint) {
+class Bot(private val conn: UsbDeviceConnection, private val epIn: UsbEndpoint, private val epOut: UsbEndpoint) : SectorSource {
     private var tag = 1
 
     // Android 에는 clearHalt 가 없어서 CLEAR_FEATURE(ENDPOINT_HALT) 를 직접 보낸다
@@ -150,6 +150,8 @@ class Bot(private val conn: UsbDeviceConnection, private val epIn: UsbEndpoint, 
         val r = cmd(cdb, n * 2048)
         return if (r.status == 0 && r.data.size == n * 2048) r.data else null
     }
+
+    override fun read(lba: Long, n: Int): ByteArray? = read10(lba, n)
 
     fun setSpeed(kbps: Int) {
         cmd(intArrayOf(0xBB, 0) + u16(kbps) + intArrayOf(0xFF, 0xFF, 0, 0, 0, 0))

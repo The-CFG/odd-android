@@ -62,7 +62,7 @@ class DiscProvider : DocumentsProvider() {
 
     override fun queryRoots(projection: Array<String>?): Cursor {
         val c = MatrixCursor(projection ?: DEFAULT_ROOT)
-        if (OddHub.bot != null && OddHub.root != null) {
+        if (OddHub.src != null && OddHub.root != null) {
             c.newRow()
                 .add(Root.COLUMN_ROOT_ID, "odd")
                 .add(Root.COLUMN_DOCUMENT_ID, ROOT_DOC)
@@ -83,7 +83,7 @@ class DiscProvider : DocumentsProvider() {
     override fun queryChildDocuments(parentDocumentId: String, projection: Array<String>?, sortOrder: String?): Cursor {
         val p = parse(parentDocumentId)
         if (!p.dir) throw FileNotFoundException("폴더가 아니에요")
-        val b = OddHub.bot ?: throw FileNotFoundException("연결 없음")
+        val b = OddHub.src ?: throw FileNotFoundException("연결 없음")
         val list = try {
             Iso.list(b, p.extent, p.size, OddHub.charset, 5000)
         } catch (e: Exception) {

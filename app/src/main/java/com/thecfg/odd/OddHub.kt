@@ -15,7 +15,7 @@ object OddHub {
     private const val GROUP = 64                       // 캐시 블록 = 64섹터 = 128KB
     private const val BLOCK_BYTES = GROUP * 2048L
 
-    @Volatile var bot: Bot? = null
+    @Volatile var src: SectorSource? = null            // 실제 디스크(Bot) 또는 ISO 파일
     @Volatile var root: IsoEntry? = null
     @Volatile var charset: Charset = Charsets.ISO_8859_1
     @Volatile var label: String = ""
@@ -30,17 +30,17 @@ object OddHub {
         ctx.contentResolver.notifyChange(DocumentsContract.buildRootsUri(DiscProvider.AUTHORITY), null)
     }
 
-    fun publish(ctx: Context, b: Bot, r: IsoEntry, cs: Charset, lbl: String) {
+    fun publish(ctx: Context, b: SectorSource, r: IsoEntry, cs: Charset, lbl: String) {
         cache.evictAll()
         gen++
-        bot = b; root = r; charset = cs; label = lbl
+        src = b; root = r; charset = cs; label = lbl
         notifyRoots(ctx)
     }
 
     /** 이 bot 이 게시한 상태일 때만 지운다 (이전 세션이 새 세션의 상태를 지우는 경합 방지) */
-    fun clear(ctx: Context, b: Bot) {
-        if (bot !== b) return
-        bot = null; root = null; label = ""
+    fun clear(ctx: Context, b: SectorSource) {
+        if (src !== b) return
+        src = null; root = null; label = ""
         gen++
         cache.evictAll()
         notifyRoots(ctx)
@@ -50,11 +50,11 @@ object OddHub {
         val key = "$g:$extent:$r"
         cache.get(key)?.let { return it }
         if (g != gen) throw IOException("디스크가 바뀌었어요")
-        val b = bot ?: throw IOException("연결 없음")
+        val b = src ?: throw IOException("연결 없음")
         val total = (fileSize + 2047) / 2048
         val first = r * GROUP
         val n = minOf(GROUP.toLong(), total - first).toInt()
-        val d = b.read10(extent + first, n) ?: throw IOException("디스크 읽기 실패")
+        val d = b.read(extent + first, n) ?: throw IOException("디스크 읽기 실패")
         cache.put(key, d)
         return d
     }

@@ -1,0 +1,9 @@
+* English is not supported yet. Supported language is Korean.
+
+Access to your CD, DVD with mobile devices.
+
+TheODDer contains music player, data manager, by accessing to the disk drive connected by USB.
+Also the ISO file is able to be accessed by this application.
+
+Accessable disk types: Every CD(CD-ROM, CD-R, CD-RW 등), every DVD but UDF
+(* UDF-type DVD and Blu-ray disks will be updated.)

@@ -16,10 +16,10 @@ object Iso {
         (b[o].toLong() and 255) or ((b[o + 1].toLong() and 255) shl 8) or
             ((b[o + 2].toLong() and 255) shl 16) or ((b[o + 3].toLong() and 255) shl 24)
 
-    fun list(bot: Bot, ext: Long, size: Long, cs: Charset, limit: Int = 2000): List<IsoEntry> {
+    fun list(src: SectorSource, ext: Long, size: Long, cs: Charset, limit: Int = 2000): List<IsoEntry> {
         val bo = ByteArrayOutputStream()
         for (i in 0 until minOf((size + 2047) / 2048, 64L).toInt()) {
-            bo.write(bot.read10(ext + i, 1) ?: break)
+            bo.write(src.read(ext + i, 1) ?: break)
         }
         val data = bo.toByteArray()
         val files = ArrayList<IsoEntry>()
@@ -41,11 +41,11 @@ object Iso {
         return files.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
     }
 
-    fun open(bot: Bot, base: Long): IsoInfo {
+    fun open(src: SectorSource, base: Long): IsoInfo {
         var pvd: ByteArray? = null
         var svd: ByteArray? = null
         for (k in 16 until 40) {
-            val sec = bot.read10(base + k, 1) ?: break
+            val sec = src.read(base + k, 1) ?: break
             if (String(sec, 1, 5, Charsets.US_ASCII) != "CD001") break
             val t = sec[0].toInt() and 255
             if (t == 1 && pvd == null) pvd = sec
@@ -61,17 +61,17 @@ object Iso {
         val label = String(vd, 40, 32, cs).replace("\u0000", "").trim()
         val sizeMb = Math.round(le32(pvd, 80) * 2048 / 1e5) / 10.0
         val root = IsoEntry("", le32(vd, 156 + 10), true, le32(vd, 156 + 2))
-        val entries = try { list(bot, root.extent, root.size, cs) } catch (e: Exception) { emptyList() }
+        val entries = try { list(src, root.extent, root.size, cs) } catch (e: Exception) { emptyList() }
         return IsoInfo(if (svd != null) "ISO9660 + Joliet" else "ISO9660", label, sizeMb, root, cs, entries)
     }
 
-    fun walk(bot: Bot, ext: Long, size: Long, cs: Charset, prefix: List<String>, depth: Int = 0): List<IsoNode> {
+    fun walk(src: SectorSource, ext: Long, size: Long, cs: Charset, prefix: List<String>, depth: Int = 0): List<IsoNode> {
         val out = ArrayList<IsoNode>()
         if (depth > 16) return out
-        for (e in list(bot, ext, size, cs)) {
+        for (e in list(src, ext, size, cs)) {
             val p = prefix + safeName(e.name)
             out += IsoNode(p, e.extent, e.size, e.isDir)
-            if (e.isDir) out += walk(bot, e.extent, e.size, cs, p, depth + 1)
+            if (e.isDir) out += walk(src, e.extent, e.size, cs, p, depth + 1)
         }
         return out
     }
